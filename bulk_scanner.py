@@ -2,11 +2,13 @@ import yfinance as yf
 import pandas as pd
 import os
 import time
+import smtplib  # Added this
+from email.message import EmailMessage  # Added this
 
 def run_overnight_analyzer(ticker_file="tickers.txt"):
     if not os.path.exists(ticker_file):
         print(f"Error: {ticker_file} not found. Create it with one ticker per line.")
-        return
+        return pd.DataFrame()
 
     with open(ticker_file, 'r') as f:
         tickers = [line.strip().upper() for line in f if line.strip()]
@@ -56,11 +58,39 @@ def run_overnight_analyzer(ticker_file="tickers.txt"):
 
     return pd.DataFrame(recommendations)
 
-if __name__ == "__main__":
-    print("Scanning tickers for overnight setups...")
-    picks = run_overnight_analyzer()
-    if not picks.empty:
-        print("\n--- TARGETS FOR OVERNIGHT PROFIT ---")
-        print(picks.to_string(index=False))
+def send_results_email(df_results, total_scanned):
+    msg = EmailMessage()
+    
+    # Check if we have results or not
+    if df_results.empty:
+        content = f"Scan Complete. \n\nTotal Stocks Checked: {total_scanned}\nSignals Found: 0\n\nMarket conditions did not meet your strict technical criteria today. No trades recommended."
+        msg['Subject'] = "Market Report: No Signals Found"
     else:
-        print("\nNo stocks met the strict technical criteria today.")
+        content = f"Scan Complete. \nTotal Stocks Checked: {total_scanned}\n\nHigh-Probability Overnight Setups:\n\n" + df_results.to_string(index=False)
+        msg['Subject'] = f"Market Report: {len(df_results)} Signals Found"
+
+    msg.set_content(content)
+    msg['From'] = os.environ.get('EMAIL_USER')
+    msg['To'] = os.environ.get('EMAIL_RECEIVER')
+
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(os.environ.get('EMAIL_USER'), os.environ.get('EMAIL_PASS'))
+            smtp.send_message(msg)
+        print("Email sent successfully!")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+if __name__ == "__main__":
+    # Get the list of tickers to know the total count
+    if not os.path.exists("tickers.txt"):
+        print("tickers.txt missing.")
+    else:
+        with open("tickers.txt", 'r') as f:
+            ticker_list = [line.strip() for line in f if line.strip()]
+        
+        print(f"Scanning {len(ticker_list)} tickers for overnight setups...")
+        picks = run_overnight_analyzer()
+        
+        # Now passing the total count to the email function
+        send_results_email(picks, len(ticker_list))

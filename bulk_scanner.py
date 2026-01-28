@@ -1,12 +1,34 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import os
 import time
 import smtplib
 from email.message import EmailMessage
 
-def run_pro_analyzer(ticker_file="tickers.txt"):
-    if not os.path.exists(ticker_file):
+def calculate_atr(df, period=14):
+    """Calculates Average True Range to measure volatility quality."""
+    high_low = df['High'] - df['Low']
+    high_cp = np.abs(df['High'] - df['Close'].shift())
+    low_cp = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def get_market_benchmarks():
+    """Fetches SPY data to calculate Relative Strength."""
+    spy = yf.Ticker("SPY").history(period="20d")
+    spy_change = (spy['Close'].iloc[-1] - spy['Close'].iloc[-2]) / spy['Close'].iloc[-2]
+    spy_is_healthy = spy['Close'].iloc[-1] > spy['Low'].iloc[-1] # Closing in upper half
+    return spy_change, spy_is_healthy
+
+def run_alpha_analyzer(ticker_file="tickers.txt"):
+    if not os.path.exists(ticker_file): return pd.DataFrame()
+
+    spy_change, market_is_healthy = get_market_benchmarks()
+    
+    # RISK GATE: If SPY is dumping, we stay in cash.
+    if not market_is_healthy:
+        print("Market (SPY) is showing weakness. Scanning aborted to protect capital.")
         return pd.DataFrame()
 
     with open(ticker_file, 'r') as f:
@@ -17,73 +39,55 @@ def run_pro_analyzer(ticker_file="tickers.txt"):
     for symbol in tickers:
         try:
             t = yf.Ticker(symbol)
-            # 1. Fundamental Filter
-            info = t.info
-            if info.get('floatShares', 0) > 500_000_000: continue
+            df = t.history(period="50d")
+            if len(df) < 20: continue
 
-            df = t.history(period="300d")
-            if len(df) < 50: continue
-
-            # 2. Technical Indicators
-            df['Rel_Vol'] = df['Volume'] / df['Volume'].rolling(10).mean()
-            df['Day_Range'] = df['High'] - df['Low']
-            df['Close_Pos'] = (df['Close'] - df['Low']) / df['Day_Range']
-            df['SMA20'] = df['Close'].rolling(20).mean()
-            df['Gap_Pct'] = (df['Open'].shift(-1) - df['Close']) / df['Close']
-
-            # 3. Strategy Definitions
-            s1 = (df['Rel_Vol'] > 1.5) & (df['Close_Pos'] > 0.85) # Power Hour
-            s2 = (df['Close'] > df['SMA20']) & (df['Rel_Vol'] > 1.8) # Trend Break
-            df['Signal'] = s1 | s2
-            
-            # 4. Backtest Metrics
-            setups = df[df['Signal'] == True].dropna()
-            if len(setups) < 3: continue 
-
-            win_rate = (len(setups[setups['Gap_Pct'] > 0]) / len(setups)) * 100
-            avg_gap = setups['Gap_Pct'].mean() * 100
-
-            # 5. Check Today's Signal & Conviction
+            # --- 1. CALCULATE VOLATILITY QUALITY (ATR) ---
+            df['ATR'] = calculate_atr(df)
             today = df.iloc[-1]
-            conviction_score = 0
-            if s1.iloc[-1]: conviction_score += 1
-            if s2.iloc[-1]: conviction_score += 1
-            if today['Rel_Vol'] > 2.5: conviction_score += 1
+            prev_day = df.iloc[-2]
+            
+            # Filter 5: Exhaustion Check
+            # If today's range is > 2.5x the average, it's a 'blow-off top' risk.
+            todays_range = today['High'] - today['Low']
+            is_exhausted = todays_range > (today['ATR'] * 2.5)
 
-            # Only proceed if we have at least one strategy signal
-            if conviction_score >= 1:
-                # RISK MANAGEMENT CALCS
-                # SL: Today's Low (Standard for overnight holds)
-                # TP: Close + (Expected Return * 1.2 for conservative target)
-                sl_price = round(today['Low'], 2)
-                tp_price = round(today['Close'] * (1 + (avg_gap / 100) * 1.2), 2)
+            # --- 2. CALCULATE RELATIVE STRENGTH (RS) ---
+            stock_change = (today['Close'] - prev_day['Close']) / prev_day['Close']
+            # RS is the outperformance margin vs SPY
+            rs_score = round((stock_change - spy_change) * 100, 2)
 
+            # --- 3. STANDARD FILTERS ---
+            rel_vol = today['Volume'] / df['Volume'].rolling(10).mean().iloc[-1]
+            close_pos = (today['Close'] - today['Low']) / (today['High'] - today['Low'])
+
+            # --- 4. COMBINED ALPHA STRATEGY ---
+            # We want: Outperforming SPY + High Vol + Strong Close + NOT Exhausted
+            if rs_score > 1.5 and rel_vol > 1.3 and close_pos > 0.80 and not is_exhausted:
                 all_results.append({
                     "Ticker": symbol,
-                    "Score": conviction_score,
-                    "Win_Rate_%": round(win_rate, 1),
-                    "Exp_Return_%": round(avg_gap, 2),
+                    "RS_vs_SPY": rs_score,
+                    "Vol_Quality": "Good" if not is_exhausted else "Exhausted",
+                    "Win_Rate_%": 0, # Placeholder for backtest if needed
+                    "Exp_Return_%": 0, # Placeholder
                     "Price": round(today['Close'], 2),
-                    "Target_TP": tp_price,
-                    "Stop_Loss": sl_price,
-                    "Rel_Vol": round(today['Rel_Vol'], 2)
+                    "Rel_Vol": round(rel_vol, 2),
+                    "ATR_Multiple": round(todays_range / today['ATR'], 2)
                 })
             
-            time.sleep(0.05) 
+            time.sleep(0.1)
         except: continue
 
     return pd.DataFrame(all_results)
 
-def send_pro_email(df):
+def send_alpha_email(df):
     if df.empty:
-        content = "<h1>No high-probability setups found today.</h1>"
-        subject = "Market Report: Neutral"
+        content = "<h1>No Alpha-Leaders found. Market conditions suggest caution.</h1>"
+        subject = "Market Report: Low Conviction"
     else:
-        # Rank the Best of the Best
-        top_safety = df.sort_values(by="Win_Rate_%", ascending=False).head(10)
-        top_explosive = df.sort_values(by="Exp_Return_%", ascending=False).head(10)
-
-        subject = f"Market Report: {len(df)} Active Signals"
+        # Best of the best: Highest Relative Strength
+        top_rs = df.sort_values(by="RS_vs_SPY", ascending=False).head(10)
+        subject = f"Alpha Report: {len(df)} Relative Strength Leaders Found"
         
         content = f"""
         <html>
@@ -91,21 +95,16 @@ def send_pro_email(df):
         <style>
             table {{ border-collapse: collapse; width: 100%; font-family: sans-serif; }}
             th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }}
-            th {{ background-color: #f2f2f2; }}
-            .safety {{ color: #2e7d32; }}
-            .explosive {{ color: #c62828; }}
+            th {{ background-color: #1a237e; color: white; }}
+            .rs {{ font-weight: bold; color: #2e7d32; }}
         </style>
         </head>
         <body>
-            <h2 class="safety">🛡️ Top 10 Safety Picks (Highest Probabilities)</h2>
-            <p>Focus on these for consistent "Base Hits."</p>
-            {top_safety.to_html(index=False)}
-            
-            <hr>
-            
-            <h2 class="explosive">🚀 Top 10 Explosive Picks (Highest Avg Returns)</h2>
-            <p>Focus on these for high-volatility "Home Runs."</p>
-            {top_explosive.to_html(index=False)}
+            <h2>🔥 Top Relative Strength Leaders</h2>
+            <p>These stocks are outperforming SPY without being overextended (ATR Filtered).</p>
+            {top_rs.to_html(index=False)}
+            <br>
+            <p><i>Note: RS_vs_SPY shows how many percentage points the stock beat the market by today.</i></p>
         </body>
         </html>
         """
@@ -121,6 +120,6 @@ def send_pro_email(df):
         smtp.send_message(msg)
 
 if __name__ == "__main__":
-    results = run_pro_analyzer()
-    print(f"Found {len(results)} signals. Sending report...")
-    send_pro_email(results)
+    results = run_alpha_analyzer()
+    print(f"Analysis complete. Found {len(results)} leaders.")
+    send_alpha_email(results)

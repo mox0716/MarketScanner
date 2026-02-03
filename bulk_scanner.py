@@ -7,7 +7,7 @@ import smtplib
 from email.message import EmailMessage
 
 def calculate_indicators(df):
-    # Trend Strength (ADX)
+    # 1. Calculate True Range and Directional Movement
     df['UpMove'] = df['High'] - df['High'].shift(1)
     df['DownMove'] = df['Low'].shift(1) - df['Low']
     df['+DM'] = np.where((df['UpMove'] > df['DownMove']) & (df['UpMove'] > 0), df['UpMove'], 0)
@@ -15,12 +15,13 @@ def calculate_indicators(df):
     df['TR'] = pd.concat([df['High']-df['Low'], abs(df['High']-df['Close'].shift()), abs(df['Low']-df['Close'].shift())], axis=1).max(axis=1)
     
     period = 14
+    # 2. Smooth the indicators
     df['+DI'] = 100 * (df['+DM'].rolling(period).mean() / df['TR'].rolling(period).mean())
     df['-DI'] = 100 * (df['-DM'].rolling(period).mean() / df['TR'].rolling(period).mean())
     df['DX'] = 100 * (abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']))
     df['ADX'] = df['DX'].rolling(period).mean()
     
-    # Moving Averages
+    # 3. Moving Averages
     df['SMA10'] = df['Close'].rolling(10).mean()
     df['SMA20'] = df['Close'].rolling(20).mean()
     return df
@@ -38,7 +39,7 @@ def run_conviction_analyzer(ticker_file="tickers.txt"):
             t = yf.Ticker(symbol)
             info = t.info
             
-            # 1. BASE FILTERS (Institutional Grade)
+            # --- BASE FILTERS ---
             mkt_cap = info.get('marketCap', 0)
             prev_close = info.get('previousClose', 0)
             if mkt_cap < 100_000_000 or prev_close < 1.00: continue
@@ -46,22 +47,36 @@ def run_conviction_analyzer(ticker_file="tickers.txt"):
             df = t.history(period="250d")
             if len(df) < 50: continue
 
-            # 2. LIQUIDITY FILTER (Avg Vol > 300k)
+            # --- LIQUIDITY FILTER ---
             avg_vol = df['Volume'].tail(30).mean()
             if avg_vol < 300_000: continue
 
-            # 3. INDICATOR CALCULATIONS
+            # --- INDICATOR CALCULATIONS ---
             df = calculate_indicators(df)
             today = df.iloc[-1]
+            yesterday = df.iloc[-2]
             
-            # Setup: Price > SMA10 > SMA20 AND strong trend (ADX > 20)
-            setup_condition = (df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > 20)
+            # --- THE "RISING ALPHA" CONDITION ---
+            # 1. Price > SMA10 > SMA20 (Upward trend)
+            # 2. ADX > 20 (Strength is present)
+            # 3. ADX Today > ADX Yesterday (Strength is INCREASING)
+            is_trending = (today['Close'] > today['SMA10']) & (today['SMA10'] > today['SMA20'])
+            is_strong = today['ADX'] > 20
+            is_accelerating = today['ADX'] > yesterday['ADX']
+
+            setup_active = is_trending and is_strong and is_accelerating
             
-            # 4. PROBABILITY BACKTEST (3-Day Window)
-            signals = df[setup_condition].index
+            # --- PROBABILITY BACKTEST ---
+            # We look back at the last year to see how this EXACT setup performed
+            # (Matches: Trend + Strength + Acceleration)
+            hist_signals = df[(df['Close'] > df['SMA10']) & 
+                              (df['SMA10'] > df['SMA20']) & 
+                              (df['ADX'] > 20) & 
+                              (df['ADX'] > df['ADX'].shift(1))].index
+            
             wins, total_signals, total_return = 0, 0, 0
 
-            for date in signals:
+            for date in hist_signals:
                 idx = df.index.get_loc(date)
                 if idx + 3 < len(df):
                     price_then = df.iloc[idx]['Close']
@@ -74,10 +89,9 @@ def run_conviction_analyzer(ticker_file="tickers.txt"):
             win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
             avg_3d_return = (total_return / total_signals * 100) if total_signals > 0 else 0
 
-            # 5. FINAL TRIGGER
-            if setup_condition.iloc[-1] and win_rate > 55:
+            # --- FINAL OUTPUT ---
+            if setup_active and win_rate > 55:
                 current_price = round(today['Close'], 2)
-                # Target Price = Current Price + Expected Avg Historical Return
                 target_price = round(current_price * (1 + (avg_3d_return / 100)), 2)
 
                 all_results.append({
@@ -94,35 +108,34 @@ def run_conviction_analyzer(ticker_file="tickers.txt"):
             time.sleep(0.05) 
         except: continue
 
-    # Ensure column order is exactly as requested
+    # Exact Column Order
     columns_order = ["ticker", "win_rate_3d", "exp_return_3d", "adx_strength", "price", "stop_loss", "target_price", "mkt_cap_m"]
     return pd.DataFrame(all_results, columns=columns_order)
 
 def send_conviction_email(df):
     if df.empty:
-        subject = "Swing Report: No High-Probability Setups"
-        content = "No stocks met the institutional liquidity and 55% win rate criteria today."
+        subject = "Swing Report: No Accelerating Setups"
+        content = "No stocks met the Rising ADX and 55% win rate criteria today."
     else:
-        # Sort by Win Rate so the best performers are at the top
         df_sorted = df.sort_values(by="win_rate_3d", ascending=False)
-        subject = f"🎯 High-Probability Swing Report: {len(df)} Setups"
+        subject = f"🚀 Momentum Report: {len(df)} Rising Setups"
         content = f"""
         <html>
         <head>
         <style>
             table {{ border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 13px; }}
             th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }}
-            th {{ background-color: #1a237e; color: white; text-transform: uppercase; }}
+            th {{ background-color: #004d40; color: white; text-transform: uppercase; }}
             tr:nth-child(even) {{ background-color: #f2f2f2; }}
-            .ticker-cell {{ font-weight: bold; color: #1a237e; }}
+            .ticker-cell {{ font-weight: bold; color: #004d40; }}
         </style>
         </head>
         <body>
-            <h2 style="color: #1a237e;">Institutional Quality 3-Day Swing Targets</h2>
-            <p>Filtered for Cap > $100M, Price > $1, and Vol > 300k. Ordered by Historical Win Rate.</p>
+            <h2 style="color: #004d40;">Accelerating 3-Day Swing Targets</h2>
+            <p>Criteria: <b>ADX > 20 and Rising</b>. This filters for trends that are actively gaining strength.</p>
             {df_sorted.to_html(index=False, classes='ticker-cell')}
             <br>
-            <p><b>Exit Strategy:</b> Target the <b>target_price</b> within 72 hours. Exit if price closes below <b>stop_loss</b>.</p>
+            <p><b>Execution:</b> Set sell orders at <b>target_price</b> and stop-loss at <b>stop_loss</b>.</p>
         </body>
         </html>
         """

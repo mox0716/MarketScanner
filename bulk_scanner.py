@@ -7,7 +7,8 @@ import smtplib
 from email.message import EmailMessage
 
 def calculate_indicators(df):
-    """Calculates ADX and Moving Averages for trend strength and direction."""
+    """Calculates technical indicators (ADX, SMA, etc.) on the dataframe."""
+    df = df.copy()
     df['UpMove'] = df['High'] - df['High'].shift(1)
     df['DownMove'] = df['Low'].shift(1) - df['Low']
     df['+DM'] = np.where((df['UpMove'] > df['DownMove']) & (df['UpMove'] > 0), df['UpMove'], 0)
@@ -25,159 +26,162 @@ def calculate_indicators(df):
     return df
 
 def get_market_tide():
-    """Returns True if SPY is healthy (above 20 SMA), else False + message."""
+    """Checks SPY to determine if the market is safe to trade."""
     try:
         spy = yf.Ticker("SPY").history(period="50d")
-        if spy.empty: return True, "Proceeding: SPY data unavailable."
+        if spy.empty: return True, "SPY Data Unavailable"
         spy_sma20 = spy['Close'].rolling(window=20).mean().iloc[-1]
         current_spy = spy['Close'].iloc[-1]
-        
         if current_spy < spy_sma20:
-            return False, f"Market Tide is LOW (SPY {current_spy:.2f} < SMA20 {spy_sma20:.2f})."
-        return True, "Market Tide is Healthy."
-    except Exception as e:
-        return True, f"Proceeding: Tide check error ({e})."
+            return False, f"Market Tide is LOW (SPY {current_spy:.2f} < {spy_sma20:.2f})"
+        return True, "Market Tide is Healthy"
+    except:
+        return True, "Market Tide Check Failed"
 
-def send_sniper_email(df, status_msg):
-    """Sends a diagnostic email regardless of whether hits were found."""
-    msg = EmailMessage()
-    user = os.environ.get('EMAIL_USER')
-    password = os.environ.get('EMAIL_PASS')
-    receiver = os.environ.get('EMAIL_RECEIVER')
-    repo = os.environ.get('GITHUB_REPOSITORY', 'MarketScanner-Main')
-
-    if df.empty:
-        subject = "⚪ Scanner Report: Zero Hits"
-        header_color = "#555555"
-        table_html = "<p>No stocks met the 3% Return / 1.5x Volume / Rising ADX criteria today.</p>"
-    else:
-        subject = f"🎯 Sniper Alert: {len(df)} High-Conviction Setups"
-        header_color = "#1a237e"
-        table_html = df.to_html(index=False, justify='left')
-
-    content = f"""
-    <html>
-    <body style="font-family: sans-serif; color: #333;">
-        <h2 style="color: {header_color};">3:1 Sniper Trading Report</h2>
-        <p><b>System Status:</b> {status_msg}</p>
-        <hr size="1" color="#ddd">
-        {table_html}
-        <br>
-        <p style="font-size: 11px; color: #888;">
-            <b>Parameters:</b> 3:1 Reward/Risk | Target: 1.03 | Stop: 0.99 | Min Win Rate: 55%<br>
-            <b>Source:</b> {repo}
-        </p>
-    </body>
-    </html>
-    """
-    
-    msg.add_alternative(content, subtype='html')
-    msg['Subject'] = subject
-    msg['From'] = user
-    msg['To'] = receiver
-
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-            smtp.login(user, password)
-            smtp.send_message(msg)
-        print("Email sent successfully.")
-    except Exception as e:
-        print(f"Email failed: {e}")
-
-def run_main():
-    ticker_file = "tickers.txt"
+def run_hybrid_scan(ticker_file="tickers.txt"):
     all_results = []
     
-    # 1. Market Tide Check (Logic requested: we can keep it active or comment the 'return' to ignore)
-    tide_ok, tide_status = get_market_tide()
-    # To bypass Tide check, comment out the next 2 lines:
-    # if not tide_ok:
-    #    send_sniper_email(pd.DataFrame(), tide_status)
-    #    return
+    # 1. Tide Check
+    tide_ok, tide_msg = get_market_tide()
+    # Note: We continue even if tide is low, but the email will warn us.
 
     if not os.path.exists(ticker_file):
-        send_sniper_email(pd.DataFrame(), f"Error: {ticker_file} not found in repository.")
-        return
+        return pd.DataFrame(), f"Error: {ticker_file} not found."
 
     with open(ticker_file, 'r') as f:
-        tickers = [line.strip().upper() for line in f if line.strip()]
+        all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    print(f"Starting optimized scan for {len(tickers)} symbols...")
+    print(f"Loaded {len(all_tickers)} tickers. Starting Hybrid Batch Scan...")
 
-    for symbol in tickers:
+    # 2. BATCH SETTINGS
+    BATCH_SIZE = 100  # Scans 100 stocks in 1 request
+    
+    for i in range(0, len(all_tickers), BATCH_SIZE):
+        batch = all_tickers[i:i+BATCH_SIZE]
+        print(f"Processing Batch {i}-{i+len(batch)} / {len(all_tickers)}...")
+        
         try:
-            t = yf.Ticker(symbol)
+            # BULK DOWNLOAD (The speed secret)
+            # auto_adjust=True fixes split/dividend data issues
+            data = yf.download(batch, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True)
             
-            # --- FAST FILTER 1: Mkt Cap & Price ---
-            # Using t.info is slower but necessary for Cap/Price without history
-            info = t.info
-            mkt_cap = info.get('marketCap', 0)
-            price = info.get('currentPrice') or info.get('regularMarketPrice') or 0
-            
-            if mkt_cap < 100_000_000 or price < 1.00:
-                continue
+            # Iterate through the batch
+            for symbol in batch:
+                try:
+                    # Handle Single Ticker vs Multi-Ticker return structure
+                    if len(batch) == 1:
+                        df = data
+                    else:
+                        df = data[symbol]
 
-            # --- FAST FILTER 2: 20-Day Volume ---
-            # Fetching only what we need to verify volume gas
-            vol_df = t.history(period="21d") # 21 days to get 20d avg + current
-            if len(vol_df) < 20: continue
-            
-            avg_vol_20d = vol_df['Volume'].iloc[:-1].mean()
-            today_vol = vol_df['Volume'].iloc[-1]
-            rel_vol = today_vol / avg_vol_20d if avg_vol_20d > 0 else 0
-            
-            if avg_vol_20d < 300_000 or rel_vol < 1.5:
-                continue
+                    # Basic Data Validation
+                    if df.empty or len(df) < 50: continue
+                    
+                    # Clean bad data (NaNs)
+                    df = df.dropna(subset=['Close', 'Volume'])
+                    if df.empty: continue
 
-            # --- DEEP SCAN: 250-Day History ---
-            print(f"Hit Gate: {symbol} - RelVol: {rel_vol:.2f}. Running deep scan...")
-            df = t.history(period="250d")
-            df = calculate_indicators(df)
-            
-            today = df.iloc[-1]
-            yesterday = df.iloc[-2]
-            
-            # Trend and Acceleration
-            is_trending = (today['Close'] > today['SMA10'] > today['SMA20'])
-            is_accelerating = (today['ADX'] > 20) and (today['ADX'] > yesterday['ADX'])
+                    # --- FILTER 1: PRICE & VOLUME (From History) ---
+                    price = df['Close'].iloc[-1]
+                    if price < 1.00: continue
+                    
+                    # Volume Check (Using History, not .info)
+                    avg_vol_20d = df['Volume'].iloc[-21:-1].mean()
+                    if avg_vol_20d < 300_000: continue
 
-            if is_trending and is_accelerating:
-                # 3-Day Probability Backtest
-                hist_signals = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & 
-                                  (df['ADX'] > 20) & (df['ADX'] > df['ADX'].shift(1))].index
-                
-                wins, total_signals, total_return = 0, 0, 0
-                for date in hist_signals:
-                    idx = df.index.get_loc(date)
-                    if idx + 3 < len(df):
-                        ret = (df.iloc[idx + 3]['Close'] - df.iloc[idx]['Close']) / df.iloc[idx]['Close']
-                        if ret > 0: wins += 1
-                        total_return += ret
-                        total_signals += 1
+                    # --- FILTER 2: INDICATORS ---
+                    df = calculate_indicators(df)
+                    today = df.iloc[-1]
+                    yesterday = df.iloc[-2]
 
-                win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
-                avg_3d_return = (total_return / total_signals * 100) if total_signals > 0 else 0
+                    # Strategy: Price > SMA10 > SMA20 AND Rising ADX
+                    is_trending = (today['Close'] > today['SMA10']) and (today['SMA10'] > today['SMA20'])
+                    is_accelerating = (today['ADX'] > 20) and (today['ADX'] > yesterday['ADX'])
 
-                # --- 3:1 SNIPER PROFITABILITY FILTER ---
-                if win_rate >= 55 and avg_3d_return >= 3.0:
-                    all_results.append({
-                        "ticker": symbol, 
-                        "win_rate_3d": f"{win_rate:.1f}%",
-                        "exp_return_3d": f"{avg_3d_return:.2f}%", 
-                        "adx": round(today['ADX'], 1),
-                        "price": round(price, 2), 
-                        "stop_loss": round(price * 0.99, 2),
-                        "target_price": round(price * 1.03, 2),
-                        "rel_vol": round(rel_vol, 2)
-                    })
+                    if is_trending and is_accelerating:
+                        # --- FILTER 3: RELATIVE VOLUME ---
+                        today_vol = df['Volume'].iloc[-1]
+                        rel_vol = today_vol / avg_vol_20d if avg_vol_20d > 0 else 0
+                        
+                        if rel_vol >= 1.5:
+                            # --- FINAL GATE: .INFO CHECK (Only runs on winners) ---
+                            # This is where we safely call .info without timeouts
+                            try:
+                                t_info = yf.Ticker(symbol).info
+                                mkt_cap = t_info.get('marketCap', 0)
+                                if mkt_cap < 100_000_000: continue
+                            except:
+                                mkt_cap = 0 # If info fails, we might still want to see it if chart is good
+
+                            # --- BACKTEST ---
+                            hist_signals = df[(df['Close'] > df['SMA10']) & 
+                                              (df['SMA10'] > df['SMA20']) & 
+                                              (df['ADX'] > 20) & 
+                                              (df['ADX'] > df['ADX'].shift(1))].index
+                            
+                            wins, total = 0, 0
+                            total_ret = 0
+                            for date in hist_signals:
+                                idx = df.index.get_loc(date)
+                                if idx + 3 < len(df):
+                                    ret = (df.iloc[idx + 3]['Close'] - df.iloc[idx]['Close']) / df.iloc[idx]['Close']
+                                    if ret > 0: wins += 1
+                                    total_ret += ret
+                                    total += 1
+                            
+                            win_rate = (wins/total * 100) if total > 0 else 0
+                            avg_ret = (total_ret/total * 100) if total > 0 else 0
+
+                            if win_rate >= 55 and avg_ret >= 3.0:
+                                all_results.append({
+                                    "ticker": symbol,
+                                    "win_rate": f"{win_rate:.1f}%",
+                                    "exp_return": f"{avg_ret:.2f}%",
+                                    "price": round(price, 2),
+                                    "target": round(price * 1.03, 2),
+                                    "stop": round(price * 0.99, 2),
+                                    "rel_vol": round(rel_vol, 2),
+                                    "mkt_cap": f"{mkt_cap/1e6:.1f}M"
+                                })
+                except Exception as e:
+                    continue # Skip individual bad tickers in batch
+
+            # Sleep slightly between batches to be polite
+            time.sleep(0.5)
             
-            time.sleep(0.05) # Prevent rate limiting
-        except:
+        except Exception as e:
+            print(f"Batch Failed: {e}")
             continue
 
-    # Final Execution
-    results_df = pd.DataFrame(all_results)
-    send_sniper_email(results_df, tide_status)
+    return pd.DataFrame(all_results), tide_msg
+
+def send_email(df, status):
+    msg = EmailMessage()
+    repo = os.environ.get('GITHUB_REPOSITORY', 'Scanner')
+    
+    if df.empty:
+        subject = "⚪ Zero Hits: Scanner Report"
+        body = f"<h3>Status: {status}</h3><p>Scanned full list. No stocks met the 3:1 criteria.</p><p>Source: {repo}</p>"
+    else:
+        subject = f"🎯 SNIPER ALERT: {len(df)} Setups Found"
+        body = f"""
+        <html><body>
+        <h2 style="color:darkgreen">High Conviction Setups</h2>
+        <p><b>Status:</b> {status}</p>
+        {df.to_html(index=False)}
+        <p>Source: {repo}</p>
+        </body></html>
+        """
+    
+    msg.add_alternative(body, subtype='html')
+    msg['Subject'] = subject
+    msg['From'] = os.environ.get('EMAIL_USER')
+    msg['To'] = os.environ.get('EMAIL_RECEIVER')
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        smtp.login(os.environ.get('EMAIL_USER'), os.environ.get('EMAIL_PASS'))
+        smtp.send_message(msg)
 
 if __name__ == "__main__":
-    run_main()
+    res, status = run_hybrid_scan()
+    send_email(res, status)

@@ -6,10 +6,6 @@ import time
 import smtplib
 from email.message import EmailMessage
 
-# --- DEBUGGING LOG ---
-def log(msg):
-    print(f"[LOG] {msg}")
-
 def calculate_indicators(df):
     df['UpMove'] = df['High'] - df['High'].shift(1)
     df['DownMove'] = df['Low'].shift(1) - df['Low']
@@ -25,53 +21,69 @@ def calculate_indicators(df):
     df['SMA20'] = df['Close'].rolling(20).mean()
     return df
 
-def run_debug_analyzer(ticker_file="tickers.txt"):
-    if not os.path.exists(ticker_file):
-        log(f"ERROR: {ticker_file} not found. Check filename casing.")
-        return pd.DataFrame()
+def get_market_tide():
+    try:
+        spy = yf.Ticker("SPY").history(period="50d")
+        if spy.empty: return True, "Caution: SPY data missing, proceeding anyway."
+        spy_sma20 = spy['Close'].rolling(window=20).mean().iloc[-1]
+        current_spy = spy['Close'].iloc[-1]
+        if current_spy < spy_sma20:
+            return False, f"Market Tide is LOW (SPY {current_spy:.2f} < SMA20 {spy_sma20:.2f})."
+        return True, "Market Tide is Healthy."
+    except:
+        return True, "Market Tide check failed, proceeding by default."
 
-    # --- MARKET TIDE BYPASS ---
-    log("MARKET TIDE CHECK: BYPASSED for debugging.")
+def run_phenomenal_analyzer(ticker_file="tickers.txt"):
+    all_results = []
     
+    # 1. Market Tide Check
+    tide_ok, tide_msg = get_market_tide()
+    if not tide_ok:
+        return pd.DataFrame(), tide_msg
+
+    if not os.path.exists(ticker_file):
+        return pd.DataFrame(), f"Error: {ticker_file} not found."
+
     with open(ticker_file, 'r') as f:
         tickers = [line.strip().upper() for line in f if line.strip()]
 
-    log(f"Loaded {len(tickers)} tickers. Beginning scan...")
-    all_results = []
-
-    for i, symbol in enumerate(tickers):
-        # Progress update every 100 tickers
-        if i % 100 == 0: log(f"Processing: {i}/{len(tickers)}...")
-        
+    print(f"Scanning {len(tickers)} tickers...")
+    
+    for symbol in tickers:
         try:
             t = yf.Ticker(symbol)
-            df = t.history(period="250d")
+            # --- FAST FILTERING ---
+            info = t.info
+            mkt_cap = info.get('marketCap', 0)
+            price = info.get('currentPrice') or info.get('regularMarketPrice') or 0
             
-            if df.empty or len(df) < 50:
+            if mkt_cap < 100_000_000 or price < 1.00:
                 continue
 
-            # 1. Volume & Cap Check
-            today_vol = df['Volume'].iloc[-1]
-            avg_vol_20d = df['Volume'].rolling(20).mean().iloc[-2]
-            rel_vol = today_vol / avg_vol_20d if avg_vol_20d > 0 else 0
-            
-            if avg_vol_20d < 300_000: continue
+            # --- VOLUME GATE ---
+            vol_df = t.history(period="20d")
+            avg_vol = vol_df['Volume'].mean()
+            if avg_vol < 300_000:
+                continue
 
-            # 2. Indicators
+            # --- DEEP SCAN & BACKTEST ---
+            df = t.history(period="250d")
             df = calculate_indicators(df)
             today = df.iloc[-1]
             yesterday = df.iloc[-2]
             
-            # 3. The Filter Stack
+            # Relative Volume
+            rel_vol = today['Volume'] / vol_df['Volume'].iloc[:-1].mean()
+
+            # The Strategy
             is_trending = (today['Close'] > today['SMA10'] > today['SMA20'])
             is_accelerating = (today['ADX'] > 20) and (today['ADX'] > yesterday['ADX'])
-            has_volume = rel_vol >= 1.5
-
-            if is_trending and is_accelerating and has_volume:
-                log(f"HIT FOUND: {symbol} (RelVol: {rel_vol:.2f})")
+            
+            if is_trending and is_accelerating and rel_vol >= 1.5:
+                # 3-Day Backtest
+                hist_signals = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & 
+                                  (df['ADX'] > 20) & (df['ADX'] > df['ADX'].shift(1))].index
                 
-                # Probability Backtest
-                hist_signals = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX'].shift(1))].index
                 wins, total_signals, total_return = 0, 0, 0
                 for date in hist_signals:
                     idx = df.index.get_loc(date)
@@ -85,28 +97,37 @@ def run_debug_analyzer(ticker_file="tickers.txt"):
                 avg_3d_return = (total_return / total_signals * 100) if total_signals > 0 else 0
 
                 if win_rate > 55 and avg_3d_return >= 3.0:
-                    price = round(today['Close'], 2)
                     all_results.append({
                         "ticker": symbol, "win_rate_3d": f"{win_rate:.1f}%",
                         "exp_return_3d": f"{avg_3d_return:.2f}%", "adx_strength": round(today['ADX'], 1),
-                        "price": price, "stop_loss": round(price * 0.99, 2),
-                        "target_price": round(price * 1.03, 2), "rel_vol": round(rel_vol, 2)
+                        "price": round(price, 2), "stop_loss": round(price * 0.99, 2),
+                        "target_price": round(price * 1.03, 2), "mkt_cap_m": f"{mkt_cap/1e6:.1f}M"
                     })
-            
-            # Tiny sleep to prevent YFinance rate limiting
-            time.sleep(0.02)
-        except Exception as e:
-            continue
+            time.sleep(0.01)
+        except: continue
 
-    log(f"Scan complete. Found {len(all_results)} qualified setups.")
-    return pd.DataFrame(all_results)
+    final_msg = tide_msg if all_results else "Tide was OK, but no stocks met the 3:1 Volume/Trend criteria."
+    return pd.DataFrame(all_results), final_msg
 
-# ... (Keep the send_email function from previous version) ...
-
-if __name__ == "__main__":
-    results = run_debug_analyzer()
-    if not results.empty:
-        # send_email(results)
-        print(results.to_string())
+def send_sniper_email(df, status_msg):
+    msg = EmailMessage()
+    repo = os.environ.get('GITHUB_REPOSITORY', 'MarketScanner')
+    
+    if df.empty:
+        subject = "⚪ Scanner Report: Zero Hits"
+        body = f"""<html><body>
+                   <h2 style='color: #555;'>No Setups Found</h2>
+                   <p><b>Status:</b> {status_msg}</p>
+                   <p>Source: {repo}</p>
+                   </body></html>"""
     else:
-        log("No qualified tickers found after full scan.")
+        subject = f"🎯 Sniper Alert: {len(df)} Setups Found"
+        body = f"""<html><body>
+                   <h2 style='color: #1a237e;'>Qualified 3:1 Swing Setups</h2>
+                   <p><b>Status:</b> {status_msg}</p>
+                   {df.to_html(index=False)}
+                   </body></html>"""
+
+    msg.add_alternative(body, subtype='html')
+    msg['Subject'] = subject
+    # ... (rest of your SMTP login code) ...
